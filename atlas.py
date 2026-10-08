@@ -813,7 +813,7 @@ def meta_atlas(run_dir):
         content = content[content.find('\n', content.find('FLXRAD,VCONV,VELSND')) + 1 : content.rfind('\n', 0, content.find('PRADK'))].strip()
         atlas_vturb = np.array(list(map(lambda x: float(x[-40:-30].strip()), content.split('\n')))) * 1e-5
         f.close()
-        if np.alltrue(atlas_vturb[0] == atlas_vturb):
+        if np.all(atlas_vturb[0] == atlas_vturb):
             output['synthe_vturb'] = np.sqrt(atlas_vturb[0] ** 2.0 + synthe_vturb ** 2.0)
         else:
             output['synthe_vturb'] = False
@@ -1263,3 +1263,44 @@ def synphot(run_dir, mag_system, reddening = 0.0, Rv = 3.1, filters_dir = python
                 pass
 
     return BC_dict
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='BasicATLAS command-line interface')
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    synthe_parser = subparsers.add_parser('synthe', help='Run the SYNTHE spectral synthesis pipeline')
+    synthe_parser.add_argument('--output-dir', required=True)
+    synthe_parser.add_argument('--min-wl', type=float, required=True)
+    synthe_parser.add_argument('--max-wl', type=float, required=True)
+    synthe_parser.add_argument('--res', type=float, default=600000.0)
+    synthe_parser.add_argument('--vturb', type=float, default=1.5)
+    synthe_parser.add_argument('--abun-adjust', nargs='*', default=[])
+    synthe_parser.add_argument('--c12c13', type=float, default=False)
+    synthe_parser.add_argument('--linelist', default='BasicATLAS')
+    synthe_parser.add_argument('--buffsize', type=int, default=2010001)
+    synthe_parser.add_argument('--overwrite-prev', action='store_true')
+    synthe_parser.add_argument('--air-wl', action='store_true')
+    synthe_parser.add_argument('--progress', action='store_true')
+    synthe_parser.add_argument('--silent', action='store_true')
+
+    args = parser.parse_args()
+
+    if args.command == 'synthe':
+        synthe(
+            output_dir=args.output_dir,
+            min_wl=args.min_wl,
+            max_wl=args.max_wl,
+            res=args.res,
+            vturb=args.vturb,
+            abun_adjust={},
+            C12C13=args.c12c13,
+            linelist=args.linelist,
+            buffsize=args.buffsize,
+            overwrite_prev=args.overwrite_prev,
+            air_wl=args.air_wl,
+            silent=args.silent,
+            progress=args.progress,
+        )
