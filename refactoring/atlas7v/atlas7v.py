@@ -5,11 +5,12 @@ import numpy as np
 
 
 class Atlas7V:
-    """Python state container and mode-2 reader for ATLAS7V model decks.
+    """Python state container and reader for ATLAS7V model/control decks.
 
-    The reader supports the model/control cards written into BasicATLAS
-    ``output_synthe.out`` files, including ``READ DECK6`` layer data. It stops
-    at ``BEGIN``, matching the mode-2 Fortran reader's return point.
+    The reader follows the Fortran ``READIN`` contract: mode 1 computes a
+    model, mode 2 reads a completed model, and mode 20 reads a model while
+    returning with ``NRHOX=0`` on an ``END`` card. It supports the cards used
+    by the BasicATLAS model and synthesis workflows.
     """
 
     _ARRAY_SHAPES = {
@@ -64,12 +65,18 @@ class Atlas7V:
             setattr(self, name, 0)
         for name in self._FLOAT_SCALARS:
             setattr(self, name, 0.0)
+        self.IFCORR = 1
+        self.IFPRES = 1
+        self.IFSCAT = 1
+        self.IFPRNT[:] = 2
+        self.IFOP[:] = [1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+        self.XSCALE = 1.0
         self.WLTE = "LTE "
         self._has_deck6 = False
         self._load_element_data()
 
     def _load_element_data(self):
-        data_file = Path(__file__).resolve().parent / "data" / "solar.csv"
+        data_file = Path(__file__).resolve().parents[2] / "data" / "solar.csv"
         atomic_numbers = np.loadtxt(data_file, delimiter=",", usecols=(0,))
         masses = np.loadtxt(data_file, delimiter=",", usecols=(1,))
         symbols = np.genfromtxt(data_file, delimiter=",", usecols=(5,), dtype=str)
@@ -90,13 +97,13 @@ class Atlas7V:
         array[:count] = values[:count]
 
     def readin(self, filename, mode=2):
-        """Read a supported ATLAS model deck and return this state object.
+        """Read an ATLAS input stream according to Fortran ``READIN``.
 
-        ``mode=2`` reads one previously calculated model and returns at its
-        ``BEGIN`` record. Mode 1 and streaming mode 20 are not implemented.
+        Modes 1 and 2 finalize at ``BEGIN``. Mode 20 has the same behavior,
+        except that ``END`` is accepted and returns with ``NRHOX=0``.
         """
-        if mode != 2:
-            raise ValueError("Only READIN mode=2 is implemented")
+        if mode not in (1, 2, 20):
+            raise ValueError("READIN mode must be 1, 2, or 20")
 
         lines = Path(filename).read_text().splitlines()
         line_index = 0
@@ -110,18 +117,29 @@ class Atlas7V:
             command = words[0]
 
             if command == "BEGIN":
-                self._finish_mode2()
+                self._finish_readin(mode)
                 return self
             if command == "END":
-                raise ValueError("READIN mode=2 does not accept an END card")
+                if mode != 20:
+                    raise ValueError("READIN END is only valid in mode=20")
+                self.NRHOX = 0
+                return self
             if command == "READ":
                 if len(words) > 1 and words[1] in ("DECK", "DECK6"):
                     line_index = self._read_deck6(lines, line_index, line)
                 elif len(words) > 1 and words[1] == "MOLECULES":
                     continue
+                elif len(words) > 1 and words[1] == "FREQUENCIES":
+                    line_index = self._read_frequencies(lines, line_index, line)
+                elif len(words) > 1 and words[1] in ("STARTING", "TAU"):
+                    line_index = self._read_starting_t_tau(lines, line_index, line)
+                elif len(words) > 1 and words[1] == "DEPARTURE":
+                    line_index = self._read_departure_coefficients(lines, line_index, line)
                 else:
-                    raise ValueError("Unsupported READ card in mode=2: {}".format(line))
+                    raise ValueError("Unsupported READIN READ card: {}".format(line))
             elif command == "TEFF":
+                self._read_teff_gravity(line)
+            elif command == "GRAVITY":
                 self._read_teff_gravity(line)
             elif command == "TITLE":
                 self.TITLE[:] = list(line[6:80].ljust(74)[:74])
@@ -140,7 +158,12 @@ class Atlas7V:
             elif command in ("PRINT", "PUNCH"):
                 self._read_print_punch(line)
             elif command == "ABUNDANCE":
-                self._read_abundances(line)
+                if len(words) > 1 and words[1] == "TABLE":
+                    line_index = self._read_abundance_table(lines, line_index)
+                else:
+                    self._read_abundances(line)
+            elif command == "CALCULATE":
+                self._read_calculate(line)
             elif command == "MOLECULES":
                 if len(words) > 1:
                     self.IFMOL = int(words[1] == "ON")
@@ -163,6 +186,17 @@ class Atlas7V:
                 values = self._numbers(line[len(words[0]):])
                 if values:
                     self.PRADK0 = values[0]
+            elif command == "WAVELENGTH":
+                self._read_wavelength(line)
+            elif command == "CHANGE":
+                if len(words) > 1 and words[1] == "RHOX":
+                    line_index = self._read_change_rhox(lines, line_index, line)
+                else:
+                    raise ValueError("Unsupported CHANGE card: {}".format(line))
+            elif command == "SCALE":
+                line_index = self._read_scale_model(line_index, line)
+            elif command == "CALL":
+                raise ValueError("CALL cards require the Fortran DUMMYR extension: {}".format(line))
             elif command == "LTE":
                 self.NLTEON = 0
                 self.WLTE = "LTE "
@@ -170,9 +204,23 @@ class Atlas7V:
                 self.NLTEON = 1
                 self.WLTE = "NLTE"
             else:
-                raise ValueError("Unsupported mode=2 input card: {}".format(line))
+                raise ValueError("Unsupported READIN input card: {}".format(line))
 
-        raise ValueError("Mode=2 input ended before a BEGIN card")
+        raise ValueError("READIN input ended before a BEGIN or valid END card")
+
+    def _finish_readin(self, mode):
+        if mode == 1:
+            missing = {
+                "NUMITS": self.NUMITS,
+                "NRHOX": self.NRHOX,
+                "NUMNU": self.NUMNU,
+                "TEFF": self.TEFF,
+                "GRAV": self.GRAV,
+            }
+            absent = [name for name, value in missing.items() if value == 0]
+            if absent:
+                raise ValueError("Mode=1 BEGIN is missing required values: " + ", ".join(absent))
+        self._finish_mode2()
 
     def _read_teff_gravity(self, line):
         teff = re.search(r"\bTEFF\s+(" + self._NUMBER.pattern + r")", line, re.IGNORECASE)
@@ -186,11 +234,176 @@ class Atlas7V:
                 self.GRAV = 10.0 ** self.GRAV
             self.GLOG = np.log10(self.GRAV)
 
+    def _read_calculate(self, line):
+        values = self._numbers(line[len("CALCULATE"):])
+        if len(values) < 3:
+            raise ValueError("CALCULATE requires NRHOX, TAU1LG, and STEPLG")
+        self.NRHOX = int(values[0])
+        if not 1 <= self.NRHOX <= 99:
+            raise ValueError("CALCULATE NRHOX must be between 1 and 99")
+        tau = 10.0 ** (values[1] + np.arange(self.NRHOX) * values[2])
+        self.TAUROS[:self.NRHOX] = tau
+        self.T[:self.NRHOX] = self.TEFF * (
+            0.75 * (0.710 + tau - 0.1331 * np.exp(-3.4488 * tau))
+        ) ** 0.25
+        self.XNE[:self.NRHOX] = 0.0
+        self.VTURB[:self.NRHOX] = 0.0
+        self.PTURB[:self.NRHOX] = 0.0
+        self.PRADK[:self.NRHOX] = 2.521e-15 * np.maximum(
+            self.T[:self.NRHOX] ** 4, self.TEFF ** 4 / 2.0
+        )
+        self.PRADK0 = self.PRADK[0]
+        self.PCON = 0.0
+        self.PTURB0 = 0.0
+        self.PZERO = self.PRADK0
+        self.PRAD[:self.NRHOX] = self.PRADK[:self.NRHOX] - self.PRADK0
+        self.RHOX[:self.NRHOX] = self.PRAD[:self.NRHOX]
+
+    def _read_wavelength(self, line):
+        values = self._numbers(line[len("WAVELENGTH"):])
+        if len(values) < 3:
+            raise ValueError("WAVELENGTH requires start, step, and end")
+        start, step, end = values[:3]
+        self.IFWAVE = 1
+        self.NULO = 1
+        self.NUHI = int((end - start) / abs(step) + 0.5) + 1
+        self.NUMNU = self.NUHI
+        if start < 1.0e7:
+            self.WBEGIN, self.DELTAW = start, step
+        elif start <= 1.0e20:
+            self.WBEGIN = 2.99792458e17 / start
+            self.DELTAW = 2.99792458e17 / step
+        else:
+            self.WBEGIN = 1.0e7 / (start / 1.0e25)
+            self.DELTAW = 1.0e7 / (step / 1.0e25)
+
+    def _read_abundance_table(self, lines, line_index):
+        values = []
+        while len(values) < 196 and line_index < len(lines):
+            values.extend(self._numbers(lines[line_index]))
+            line_index += 1
+        if len(values) < 196:
+            raise ValueError("ABUNDANCE TABLE is incomplete")
+        self.ABUND[0] = values[0]
+        self.ABUND[1] = values[1]
+        for index in range(2, 99):
+            self.ABUND[index] = values[2 + 2 * (index - 2)]
+        relative = np.zeros(99)
+        for index in range(2, 99):
+            relative[index] = values[3 + 2 * (index - 2)]
+        self.ABUND += relative
+        return line_index
+
+    def _read_frequencies(self, lines, line_index, line):
+        values = self._numbers(line[len("READ FREQUENCIES"):])
+        if len(values) < 3:
+            raise ValueError("READ FREQUENCIES requires count, lower, and upper indices")
+        self.NUMNU, self.NULO, self.NUHI = map(int, values[:3])
+        if not 1 <= self.NUMNU <= 500:
+            raise ValueError("READ FREQUENCIES count must be between 1 and 500")
+        tokens = line.upper().split()
+        self.FREQID[:] = " "
+        for index, token in enumerate(tokens[4:10]):
+            self.FREQID[index] = token[:1]
+        while line_index < len(lines) and np.count_nonzero(self.FRESET[:self.NUMNU]) < self.NUMNU:
+            row = self._numbers(lines[line_index])
+            line_index += 1
+            for offset in range(0, len(row) - 2, 3):
+                index, frequency, coefficient = row[offset:offset + 3]
+                index = int(index)
+                if not 1 <= index <= 500:
+                    raise ValueError("Frequency index out of range: {}".format(index))
+                if frequency < 1.0e7:
+                    frequency = 2.99792458e17 / frequency
+                elif frequency > 1.0e20:
+                    frequency *= 2.99792458e10 / 1.0e25
+                self.FRESET[index - 1] = frequency
+                self.RCOSET[index - 1] = coefficient
+        return line_index
+
+    def _read_starting_t_tau(self, lines, line_index, line):
+        values = self._numbers(line[len("READ STARTING T-TAU"):])
+        if not values:
+            raise ValueError("READ STARTING T-TAU requires a layer count")
+        count = int(values[0])
+        if not 1 <= count <= 99:
+            raise ValueError("Starting T-TAU layer count must be between 1 and 99")
+        rows = []
+        while len(rows) < count and line_index < len(lines):
+            rows.append(self._numbers(lines[line_index]))
+            line_index += 1
+        if any(len(row) < 2 for row in rows):
+            raise ValueError("READ STARTING T-TAU rows require TAUROS and T")
+        self.NRHOX = count
+        self.TAUROS[:count] = [row[0] for row in rows]
+        self.T[:count] = [row[1] for row in rows]
+        if self.TAUROS[0] <= 0:
+            self.TAUROS[:count] = 10.0 ** self.TAUROS[:count]
+        return line_index
+
+    def _read_departure_coefficients(self, lines, line_index, line):
+        values = self._numbers(line[len("READ DEPARTURE COEFFICIENTS"):])
+        if not values:
+            raise ValueError("READ DEPARTURE COEFFICIENTS requires a layer count")
+        count = int(values[0])
+        if not 1 <= count <= 99:
+            raise ValueError("Departure-coefficient layer count must be between 1 and 99")
+        for layer in range(count):
+            if line_index >= len(lines):
+                raise ValueError("Incomplete departure-coefficient data")
+            row = self._numbers(lines[line_index])
+            line_index += 1
+            if len(row) < 7:
+                raise ValueError("Departure-coefficient rows require 7 values")
+            self.BHYD[layer, :6] = row[1:7]
+            self.BMIN[layer] = row[7] if len(row) > 7 else 1.0
+        self.NRHOX = max(self.NRHOX, count)
+        self.NLTEON = 1
+        self.WLTE = "NLTE"
+        return line_index
+
+    def _read_change_rhox(self, lines, line_index, line):
+        values = self._numbers(line[len("CHANGE RHOX"):])
+        if not values:
+            raise ValueError("CHANGE RHOX requires a layer count")
+        count = int(values[0])
+        rows = []
+        while len(rows) < count and line_index < len(lines):
+            rows.append(self._numbers(lines[line_index]))
+            line_index += 1
+        if any(not row for row in rows):
+            raise ValueError("CHANGE RHOX contains an incomplete grid")
+        new_rhox = np.array([row[0] for row in rows], dtype=np.float64)
+        old_rhox = self.RHOX[:self.NRHOX].copy()
+        if self.NRHOX == 0:
+            raise ValueError("CHANGE RHOX requires an existing model")
+        for name in ("T", "P", "XNE", "ABROSS", "VTURB", "PRAD", "BMIN"):
+            values = np.interp(new_rhox, old_rhox, getattr(self, name)[:self.NRHOX])
+            getattr(self, name)[:count] = values
+        self.NRHOX = count
+        self.RHOX[:count] = new_rhox
+        self.PRADK[:count] = self.PRAD[:count] + self.PRADK0
+        return line_index
+
+    def _read_scale_model(self, line_index, line):
+        values = self._numbers(line[len("SCALE MODEL"):])
+        if len(values) < 3:
+            raise ValueError("SCALE MODEL requires layer count, effective temperature, and gravity")
+        count, teff, gravity = int(values[0]), values[1], values[2]
+        self.NRHOX = count
+        if gravity < 10:
+            gravity = 10.0 ** gravity
+        self.TEFF = teff
+        self.GRAV = gravity
+        self.GLOG = np.log10(gravity)
+        return line_index
+
     def _read_print_punch(self, line):
         for keyword, array in (("PRINT", self.IFPRNT), ("PUNCH", self.IFPNCH)):
             match = re.search(r"\b{}\b(.*?)(?=\b(?:PRINT|PUNCH)\b|$)".format(keyword), line, re.IGNORECASE)
             if match:
-                self._set_values(array, [int(value) for value in self._numbers(match.group(1))])
+                values = [int(value) for value in self._numbers(match.group(1))]
+                array[:len(values)] = values
 
     def _read_abundances(self, line):
         scale = re.search(r"\bSCALE\s+(" + self._NUMBER.pattern + r")", line, re.IGNORECASE)

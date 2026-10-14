@@ -73,3 +73,24 @@ source compile.com
 ```
 
 This should generate `spectrv.so`, `synthe.so` and `xnfpelsyn.so` in `BasicATLAS/PyTLAS/bin/`.
+
+### Compare the Python and Fortran READIN implementations
+
+The refactoring parser can be checked against the original Fortran `READIN`
+routine with the comparison harness. It compiles a small probe from
+`refactoring/atlas7v/atlas7v.for`, parses the same deck with
+`refactoring/atlas7v/atlas7v.py`, and compares the requested scalar, control,
+and atmospheric fields. Integer/control fields use exact equality; floating
+point fields use `rtol=1e-12` and `atol=1e-12` by default.
+
+From the repository root, run:
+
+```bash
+python refactoring/atlas7v/compare_readin.py \
+  /home/bbzze2/ATLAS_sun_model/output_synthe.out
+```
+
+The Fortran probe opens `data/atlas_files/molecules.dat` as unit 2 by default.
+Use `--molecules` for another table, `--compiler` to select a compiler, or
+`--rtol`/`--atol` to change numerical tolerances. The harness requires a
+Fortran compiler (`gfortran`, `ifx`, or `ifort`) in `PATH`, or via `FC`.

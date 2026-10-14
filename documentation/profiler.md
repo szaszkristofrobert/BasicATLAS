@@ -56,11 +56,14 @@ command -v python3
 
 ## 1. Build the instrumented executable
 
-From the `BasicATLAS` directory, build the profiled executable without modifying the normal executable:
+Change to the `BasicATLAS` directory, then build the profiled executable without modifying the normal executable:
 
 ```bash
+cd /home/bbzze2/BasicATLAS
+
 mkdir -p bin/profile
 
+gfortran -fno-automatic -w -O3 -c src/atlas7v.for -std=legacy
 gfortran -fno-automatic -w -O3 -pg -c src/spectrv.patched.for -std=legacy
 
 gfortran -pg -o bin/profile/spectrv.profile.exe spectrv.patched.o atlas7v.o -std=legacy
@@ -72,29 +75,13 @@ The `-pg` option causes the compiler to insert profiling calls and makes the gen
 
 `-Winvalid-pch`, `-fstack-protector`, or other additional flags are not required for this workflow. Keep the same compile settings as the production build as much as possible so that the profile reflects the normal optimized code.
 
-If `atlas7v.o` is not already available, build it first:
-
-```bash
-mkdir -p bin/profile
-
-gfortran -fno-automatic -w -O3 -c src/atlas7v.for -std=legacy
-```
-
-The current repository build also produces the unprofiled executable with:
-
-```bash
-gfortran -fno-automatic -w -O3 -c src/spectrv.patched.for -std=legacy
-gfortran spectrv.patched.o atlas7v.o -o bin/spectrv.exe -std=legacy
-rm atlas7v.o spectrv.patched.o
-```
-
 ## 2. Generate the SYNTHE inputs
 
 The ATLAS outputs are already available in the current directory. Generate the `SPECTRV` input and launch script from them with the Python wrapper:
 
 ```bash
 cd /home/bbzze2/ATLAS_sun_model
-python3 /home/bbzze2/BasicATLAS/atlas.py synthe --output-dir /home/bbzze2/ATLAS_sun_model --min-wl 2850 --max-wl 3000 --res 600000 --vturb 1.5
+/opt/miniconda3/envs/atlas/bin/python /home/bbzze2/BasicATLAS/atlas.py synthe --output-dir /home/bbzze2/ATLAS_sun_model --min-wl 2850 --max-wl 3000 --res 600000 --vturb 1.5
 ```
 
 The command creates:
@@ -112,9 +99,10 @@ The generated `output_synthe.out` is the input that `SPECTRV` reads through stan
 
 ## 3. Replace the SPECTRV command in the launcher
 
-The profiling launch must use the instrumented binary:
+The profiling launch must use the instrumented binary. Do not run this path by
+itself at this step; it is the executable path that the launcher will invoke:
 
-```bash
+```text
 /home/bbzze2/BasicATLAS/bin/profile/spectrv.profile.exe
 ```
 
