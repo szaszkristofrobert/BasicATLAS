@@ -4,6 +4,36 @@ from pathlib import Path
 import numpy as np
 
 
+class _LineBuffer:
+    """Lazily buffer lines from an iterator for card readers."""
+
+    def __init__(self, lines):
+        self._lines = iter(lines)
+        self._buffer = []
+        self._exhausted = False
+
+    def _fill_one(self):
+        if self._exhausted:
+            return
+        try:
+            self._buffer.append(next(self._lines).rstrip("\r\n"))
+        except StopIteration:
+            self._exhausted = True
+
+    def __len__(self):
+        return len(self._buffer)
+
+    def has(self, index):
+        while index >= len(self._buffer) and not self._exhausted:
+            self._fill_one()
+        return index < len(self._buffer)
+
+    def __getitem__(self, index):
+        if not self.has(index):
+            raise IndexError(index)
+        return self._buffer[index]
+
+
 class Atlas7V:
     """Python state container and reader for ATLAS7V model/control decks.
 
@@ -73,6 +103,7 @@ class Atlas7V:
         self.XSCALE = 1.0
         self.WLTE = "LTE "
         self._has_deck6 = False
+        self._readin_completed = False
         self._load_element_data()
 
     def _load_element_data(self):
@@ -101,13 +132,26 @@ class Atlas7V:
 
         Modes 1 and 2 finalize at ``BEGIN``. Mode 20 has the same behavior,
         except that ``END`` is accepted and returns with ``NRHOX=0``.
+
+        ``filename`` may also be a text stream or iterator of lines. In that
+        case the input remains positioned after the card that terminated this
+        call, so repeated mode-20 calls process successive model decks.
         """
         if mode not in (1, 2, 20):
             raise ValueError("READIN mode must be 1, 2, or 20")
 
-        lines = Path(filename).read_text().splitlines()
+        if getattr(self, "_readin_completed", False):
+            self._reset_deck_state()
+
+        if hasattr(filename, "read"):
+            lines = _LineBuffer(filename)
+        elif not isinstance(filename, (str, Path)):
+            lines = _LineBuffer(filename)
+        else:
+            lines = Path(filename).read_text().splitlines()
+
         line_index = 0
-        while line_index < len(lines):
+        while lines.has(line_index) if isinstance(lines, _LineBuffer) else line_index < len(lines):
             line = lines[line_index].strip()
             line_index += 1
             if not line:
@@ -118,11 +162,13 @@ class Atlas7V:
 
             if command == "BEGIN":
                 self._finish_readin(mode)
+                self._readin_completed = True
                 return self
             if command == "END":
                 if mode != 20:
                     raise ValueError("READIN END is only valid in mode=20")
                 self.NRHOX = 0
+                self._readin_completed = True
                 return self
             if command == "READ":
                 if len(words) > 1 and words[1] in ("DECK", "DECK6"):
@@ -208,6 +254,25 @@ class Atlas7V:
 
         raise ValueError("READIN input ended before a BEGIN or valid END card")
 
+    def _reset_deck_state(self):
+        for name in self._ARRAY_SHAPES:
+            getattr(self, name)[:] = 0
+        for name in self._CHAR_ARRAYS:
+            getattr(self, name)[:] = " "
+        for name in self._INTEGER_SCALARS:
+            setattr(self, name, 0)
+        for name in self._FLOAT_SCALARS:
+            setattr(self, name, 0.0)
+        self.IFCORR = 1
+        self.IFPRES = 1
+        self.IFSCAT = 1
+        self.IFPRNT[:] = 2
+        self.IFOP[:] = [1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+        self.XSCALE = 1.0
+        self.WLTE = "LTE "
+        self._has_deck6 = False
+        self._readin_completed = False
+
     def _finish_readin(self, mode):
         if mode == 1:
             missing = {
@@ -279,7 +344,9 @@ class Atlas7V:
 
     def _read_abundance_table(self, lines, line_index):
         values = []
-        while len(values) < 196 and line_index < len(lines):
+        while len(values) < 196 and (
+            lines.has(line_index) if isinstance(lines, _LineBuffer) else line_index < len(lines)
+        ):
             values.extend(self._numbers(lines[line_index]))
             line_index += 1
         if len(values) < 196:
@@ -305,7 +372,9 @@ class Atlas7V:
         self.FREQID[:] = " "
         for index, token in enumerate(tokens[4:10]):
             self.FREQID[index] = token[:1]
-        while line_index < len(lines) and np.count_nonzero(self.FRESET[:self.NUMNU]) < self.NUMNU:
+        while (
+            lines.has(line_index) if isinstance(lines, _LineBuffer) else line_index < len(lines)
+        ) and np.count_nonzero(self.FRESET[:self.NUMNU]) < self.NUMNU:
             row = self._numbers(lines[line_index])
             line_index += 1
             for offset in range(0, len(row) - 2, 3):
@@ -329,7 +398,9 @@ class Atlas7V:
         if not 1 <= count <= 99:
             raise ValueError("Starting T-TAU layer count must be between 1 and 99")
         rows = []
-        while len(rows) < count and line_index < len(lines):
+        while len(rows) < count and (
+            lines.has(line_index) if isinstance(lines, _LineBuffer) else line_index < len(lines)
+        ):
             rows.append(self._numbers(lines[line_index]))
             line_index += 1
         if any(len(row) < 2 for row in rows):
@@ -368,7 +439,9 @@ class Atlas7V:
             raise ValueError("CHANGE RHOX requires a layer count")
         count = int(values[0])
         rows = []
-        while len(rows) < count and line_index < len(lines):
+        while len(rows) < count and (
+            lines.has(line_index) if isinstance(lines, _LineBuffer) else line_index < len(lines)
+        ):
             rows.append(self._numbers(lines[line_index]))
             line_index += 1
         if any(not row for row in rows):
@@ -378,8 +451,12 @@ class Atlas7V:
         if self.NRHOX == 0:
             raise ValueError("CHANGE RHOX requires an existing model")
         for name in ("T", "P", "XNE", "ABROSS", "VTURB", "PRAD", "BMIN"):
-            values = np.interp(new_rhox, old_rhox, getattr(self, name)[:self.NRHOX])
+            values = self._map1(old_rhox, getattr(self, name)[:self.NRHOX], new_rhox)
             getattr(self, name)[:count] = values
+        for column in range(6):
+            self.BHYD[:count, column] = self._map1(
+                old_rhox, self.BHYD[:self.NRHOX, column], new_rhox
+            )
         self.NRHOX = count
         self.RHOX[:count] = new_rhox
         self.PRADK[:count] = self.PRAD[:count] + self.PRADK0
@@ -387,16 +464,200 @@ class Atlas7V:
 
     def _read_scale_model(self, line_index, line):
         values = self._numbers(line[len("SCALE MODEL"):])
-        if len(values) < 3:
-            raise ValueError("SCALE MODEL requires layer count, effective temperature, and gravity")
-        count, teff, gravity = int(values[0]), values[1], values[2]
+        if len(values) < 5:
+            raise ValueError(
+                "SCALE MODEL requires layer count, log-tau start, log-tau step, "
+                "effective temperature, and gravity"
+            )
+        count, tau1lg, steplg, teff1, gravity = values[:5]
+        if not 1 <= int(count) <= 99:
+            raise ValueError("SCALE MODEL layer count must be between 1 and 99")
+        if self.NRHOX < 2:
+            raise ValueError("SCALE MODEL requires an existing model with at least two layers")
+        count = int(count)
+        gravity = 10.0 ** gravity if gravity < 10.0 else gravity
+        old_count = self.NRHOX
+        tau_old = self._integrate(
+            self.RHOX[:old_count], self.ABROSS[:old_count],
+            self.ABROSS[0] * self.RHOX[0],
+        )
+        tau_old[0] = 0.0
+        tau_new = 10.0 ** (tau1lg + np.arange(count) * steplg)
+        source = {
+            name: getattr(self, name)[:old_count].copy()
+            for name in ("RHOX", "T", "P", "XNE", "ABROSS", "PRAD", "VTURB", "BMIN")
+        }
+        for name, values_old in source.items():
+            getattr(self, name)[:count] = self._map1(tau_old, values_old, tau_new)
+        for column in range(6):
+            self.BHYD[:count, column] = self._map1(
+                tau_old, self.BHYD[:old_count, column], tau_new
+            )
         self.NRHOX = count
-        if gravity < 10:
-            gravity = 10.0 ** gravity
-        self.TEFF = teff
+        self.PRADK[:count] = self.PRAD[:count] + self.PRADK0
+        if teff1 == 0.0:
+            return line_index
+        if teff1 == self.TEFF and gravity == self.GRAV:
+            return line_index
+        self.TAUROS[:count] = tau_new
+        ratio = teff1 / self.TEFF
+        self.T[:count] *= ratio
+        self.PTURB[:count] = 0.0
+        self.PRADK[:count] *= ratio ** 4
+        self.PRAD[:count] *= ratio ** 4
+        self.PRADK0 *= ratio ** 4
+        self.PZERO = self.PCON + self.PRADK0 + self.PTURB0
+        self.TEFF = teff1
+        self.FLUX = 5.6697e-5 / 12.5664 * teff1 ** 4
         self.GRAV = gravity
         self.GLOG = np.log10(gravity)
+        self._ttaup(count)
+        self.RHOX[:count] = self.PTOTAL[:count] / gravity
+        self.PTOTAL[:count] += self.PZERO
         return line_index
+
+    @staticmethod
+    def _map1(x_old, f_old, x_new):
+        """Match the legacy quadratic MAP1 interpolation routine."""
+        x_old = np.asarray(x_old, dtype=np.float64)
+        f_old = np.asarray(f_old, dtype=np.float64)
+        x_new = np.asarray(x_new, dtype=np.float64)
+        n_old = len(x_old)
+        if n_old < 2:
+            raise ValueError("MAP1 requires at least two source points")
+        result = np.empty_like(x_new)
+        l = 1
+        ll = 0
+        a = b = c = 0.0
+        a_back = b_back = c_back = 0.0
+        for k, value in enumerate(x_new):
+            while l < n_old and value >= x_old[l]:
+                l += 1
+            if l < 1:
+                l = 1
+            if l == ll:
+                result[k] = a + (b + c * value) * value
+                continue
+            if l <= 2 or l >= n_old:
+                endpoint = min(n_old, l + 1)
+                c = 0.0
+                b = (f_old[endpoint - 1] - f_old[endpoint - 2]) / (
+                    x_old[endpoint - 1] - x_old[endpoint - 2]
+                )
+                a = f_old[endpoint - 1] - x_old[endpoint - 1] * b
+                ll = l
+                result[k] = a + (b + c * value) * value
+                continue
+            l1 = l - 1
+            l2 = l - 2
+            d = (f_old[l1] - f_old[l2]) / (x_old[l1] - x_old[l2])
+            c_back = (
+                f_old[l] / ((x_old[l] - x_old[l1]) * (x_old[l] - x_old[l2]))
+                + (f_old[l2] / (x_old[l] - x_old[l2]) - f_old[l1] / (x_old[l] - x_old[l1]))
+                / (x_old[l1] - x_old[l2])
+            )
+            b_back = d - (x_old[l1] + x_old[l2]) * c_back
+            a_back = f_old[l2] - x_old[l2] * d + x_old[l1] * x_old[l2] * c_back
+            if l < n_old - 1:
+                d = (f_old[l] - f_old[l1]) / (x_old[l] - x_old[l1])
+                c_forward = (
+                    f_old[l + 1] / ((x_old[l + 1] - x_old[l]) * (x_old[l + 1] - x_old[l1]))
+                    + (f_old[l1] / (x_old[l + 1] - x_old[l1]) - f_old[l] / (x_old[l + 1] - x_old[l]))
+                    / (x_old[l] - x_old[l1])
+                )
+                b_forward = d - (x_old[l] + x_old[l1]) * c_forward
+                a_forward = f_old[l1] - x_old[l1] * d + x_old[l] * x_old[l1] * c_forward
+                weight = (
+                    abs(c_forward) / (abs(c_forward) + abs(c_back))
+                    if c_forward != 0.0 else 0.0
+                )
+                a = a_forward + weight * (a_back - a_forward)
+                b = b_forward + weight * (b_back - b_forward)
+                c = c_forward + weight * (c_back - c_forward)
+            else:
+                a, b, c = a_back, b_back, c_back
+            ll = l
+            result[k] = a + (b + c * value) * value
+        return result
+
+    @classmethod
+    def _opacity_table(cls):
+        if hasattr(cls, "_kitt_peak_table"):
+            return cls._kitt_peak_table
+        lines = Path(__file__).with_suffix(".for").read_text().splitlines()
+        table = []
+        for index, line in enumerate(lines):
+            if not re.match(r"\s*DATA KTAB(?:0?[1-9]|[12][0-9]|30)/", line):
+                continue
+            values = []
+            for row in lines[index + 1:]:
+                values.extend(int(value) for value in re.findall(r"[-+]?\d+", row[6:70]))
+                if "/" in row:
+                    break
+            if len(values) != 36:
+                raise ValueError("Invalid Kitt Peak opacity table in atlas7v.for")
+            table.append(values)
+        if len(table) != 30:
+            raise ValueError("Kitt Peak opacity table is incomplete")
+        cls._kitt_peak_table = np.asarray(table, dtype=np.float64).T / 1000.0
+        return cls._kitt_peak_table
+
+    def _ttaup(self, count):
+        tab_t = np.array([3.500, 3.525, 3.550, 3.575, 3.600, 3.625, 3.650,
+                          3.675, 3.700, 3.725, 3.750, 3.775, 3.800, 3.825,
+                          3.850, 3.875, 3.900, 3.925, 3.950, 3.975, 4.000,
+                          4.050, 4.100, 4.150, 4.200, 4.250, 4.300, 4.350,
+                          4.400, 4.450, 4.500, 4.600, 4.700, 4.800, 4.900,
+                          5.000])
+        tab_p = np.array([-2.000, -1.500, -1.000, -.500, 0.000, .500, 1.000,
+                          1.250, 1.500, 1.750, 2.000, 2.250, 2.500, 2.750,
+                          3.000, 3.200, 3.400, 3.600, 3.800, 4.000, 4.200,
+                          4.400, 4.600, 4.800, 5.000, 5.200, 5.400, 5.600,
+                          5.800, 6.000])
+        table = self._opacity_table()
+        tau = self.TAUROS[:count]
+        if tau[0] <= 0.0:
+            tau = tau.copy()
+            tau[0] = tau[1] * 0.5
+        opacity = np.empty(30)
+        total = np.empty(count)
+        pressure = np.empty(count)
+        original_t0 = self.T[0]
+        self.ABROSS[0] = 0.1
+        if self.PRAD[0] > 0.0:
+            self.ABROSS[0] = min(0.1, self.GRAV * tau[0] / self.PRAD[0] / 2.0)
+        self.T[0] = self.T[1]
+        previous = [0.0, 0.0, 0.0, 0.0]
+        previous_delta = [0.0, 0.0, 0.0]
+        for j in range(count):
+            for ip in range(30):
+                opacity[ip] = self._map1(tab_t, table[:, ip], [np.log10(self.T[j])])[0]
+            p_log = np.log(self.GRAV / self.ABROSS[0] * tau[0]) if j == 0 else (
+                previous_delta[0] + previous[0] if j < 4 else
+                (3 * previous[3] + 8 * previous_delta[0] - 4 * previous_delta[1] + 8 * previous_delta[2]) / 3
+            )
+            error = 1.0
+            for _ in range(1000):
+                total[j] = np.exp(p_log)
+                pressure[j] = total[j] + (self.PRAD[0] - self.PRAD[j]) - self.PTURB[j]
+                if pressure[j] <= 0.0:
+                    break
+                self.ABROSS[j] = np.exp(self._map1(tab_p, opacity, [np.log10(pressure[j])])[0])
+                delta = self.GRAV / self.ABROSS[j] * tau[j] / total[j] * np.log(tau[1] / tau[0])
+                p_new = np.log(self.GRAV / self.ABROSS[0] * tau[0]) if j == 0 else (
+                    (p_log + 2 * previous[0] + delta + previous_delta[0]) / 3 if j < 4 else
+                    (126 * previous[0] - 14 * previous[2] + 9 * previous[3] + 42 * delta
+                     + 108 * previous_delta[0] - 54 * previous_delta[1] + 24 * previous_delta[2]) / 121
+                )
+                error = abs(p_new - p_log)
+                p_log = (p_new + p_log) / 2
+                if error <= 0.00005:
+                    break
+            previous = [p_log, previous[0], previous[1], previous[2]]
+            previous_delta = [delta, previous_delta[0], previous_delta[1]]
+        self.T[0] = original_t0
+        self.PTOTAL[:count] = total
+        self.P[:count] = pressure
 
     def _read_print_punch(self, line):
         for keyword, array in (("PRINT", self.IFPRNT), ("PUNCH", self.IFPNCH)):
@@ -472,7 +733,9 @@ class Atlas7V:
         column_text = " ".join(words[3:])
         columns = [name.strip().upper() for name in column_text.split(",") if name.strip()]
         rows = []
-        while len(rows) < n_layers and line_index < len(lines):
+        while len(rows) < n_layers and (
+            lines.has(line_index) if isinstance(lines, _LineBuffer) else line_index < len(lines)
+        ):
             row = lines[line_index].strip()
             line_index += 1
             if not row:

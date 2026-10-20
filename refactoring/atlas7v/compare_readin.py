@@ -122,17 +122,34 @@ def _compile_probe(source: Path, executable: Path, compiler: str | None = None) 
             "A Fortran compiler is required (set FC or install gfortran/ifx/ifort)"
         )
     compiler_name = Path(compiler).name.lower()
+    reference_source = Path(__file__).with_name("atlas7v.for")
     if compiler_name == "gfortran":
         flags = [
-            "-O0", "-std=legacy", "-ffixed-line-length-none",
+            "-O0", "-std=legacy", "-ffixed-line-length-72",
             "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+            "-Wno-argument-mismatch",
         ]
+        command = [compiler, *flags, "-o", str(executable), str(source), str(reference_source)]
     else:
-        flags = ["-O0", "-fixed"]
-    command = [
-        compiler, *flags, "-o", str(executable), str(source),
-        str(Path(__file__).with_name("atlas7v.for")),
-    ]
+        reference_object = executable.with_suffix(".reference.o")
+        probe_object = executable.with_suffix(".probe.o")
+        try:
+            subprocess.run(
+                [compiler, "-O0", "-fixed", "-c", "-o", str(reference_object), str(reference_source)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [compiler, "-O0", "-fixed", "-extend-source", "-c", "-o", str(probe_object), str(source)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            command = [compiler, "-O0", "-o", str(executable), str(probe_object), str(reference_object)]
+        except subprocess.CalledProcessError as error:
+            diagnostic = (error.stdout + "\n" + error.stderr).strip()
+            raise RuntimeError("Could not compile the Fortran READIN probe:\n" + diagnostic) from error
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
     except FileNotFoundError as error:
@@ -164,21 +181,33 @@ def _fortran_state(
                     result.returncode, result.stdout, result.stderr
                 )
             )
-        return _parse_dump(dump)
+        state = _parse_dump(dump)
+        missing = sorted(set(FIELDS) - set(state))
+        if missing:
+            raise RuntimeError(
+                "Fortran READIN probe produced an incomplete state dump; "
+                "missing: {}. Fortran stdout: {!r}; stderr: {!r}".format(
+                    ", ".join(missing), result.stdout, result.stderr
+                )
+            )
+        return state
 
 
 def _parse_dump(filename: Path) -> dict[str, object]:
     state: dict[str, object] = {}
     for line in filename.read_text().splitlines():
-        kind, name, index, value = (line.split() + [None, None])[:4]
+        fields = line.split(maxsplit=3)
+        if len(fields) < 3:
+            continue
+        kind, name = fields[:2]
         if kind == "S":
-            state[name] = float(index)
+            state[name] = float(fields[2])
         elif kind == "I":
-            state[name] = int(index)
-        elif kind == "A":
-            state.setdefault(name, np.zeros(99, dtype=np.float64))[int(index) - 1] = float(value)
-        elif kind == "AI":
-            state.setdefault(name, np.zeros(20 if name == "IFOP" else 15, dtype=np.int64))[int(index) - 1] = int(value)
+            state[name] = int(fields[2])
+        elif kind == "A" and len(fields) >= 4:
+            state.setdefault(name, np.zeros(99, dtype=np.float64))[int(fields[2]) - 1] = float(fields[3])
+        elif kind == "AI" and len(fields) >= 4:
+            state.setdefault(name, np.zeros(20 if name == "IFOP" else 15, dtype=np.int64))[int(fields[2]) - 1] = int(fields[3])
     return state
 
 

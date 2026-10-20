@@ -94,3 +94,8 @@ The Fortran probe opens `data/atlas_files/molecules.dat` as unit 2 by default.
 Use `--molecules` for another table, `--compiler` to select a compiler, or
 `--rtol`/`--atol` to change numerical tolerances. The harness requires a
 Fortran compiler (`gfortran`, `ifx`, or `ifort`) in `PATH`, or via `FC`.
+
+`Atlas7V.readin(..., mode=20)` also accepts a seekable text stream. Reusing
+the same stream processes successive decks exactly as repeated Fortran
+`READIN(20)` calls: `BEGIN` returns the completed model, while `END` returns
+with `NRHOX=0`.
